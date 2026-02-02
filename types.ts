@@ -1,3 +1,4 @@
+
 // 텍스트 속성 (공통)
 export interface TextProperties {
   font_size: string;
@@ -82,6 +83,7 @@ export interface WorkItem {
   originalImage: string;
   generatedImage: string | null;
   status: 'idle' | 'analyzing' | 'selecting' | 'processing' | 'complete' | 'error';
+  statusMessage?: string; // [NEW] Detailed status feedback (e.g., "Retrying 2/5...")
   error: string | null;
   
   copywritingOptions: CopywritingOption[];
