@@ -3,77 +3,110 @@ import { useAppStore } from "../store/useAppStore";
 import { CopywritingOption, AnalysisStage, RenderingPreservation, ValidationResult, TextReplacement, BoxStructure } from "../types";
 
 // [SECURITY CHECK] Ensure this code ONLY runs in a browser (Client-Side)
-// 이 코드는 오직 사용자의 브라우저에서만 실행되어야 합니다.
-// 서버(Node.js 등)에서 실행될 경우 개발자의 키가 유출될 위험을 원천 차단하기 위해 강제 에러를 발생시킵니다.
 if (typeof window === 'undefined') {
     throw new Error("🚨 CRITICAL SECURITY ERROR: This service is CLIENT-SIDE ONLY. Do not deploy to a server.");
 }
 
 // [CRITICAL] API Client Factory - Enforces usage of the specific User Key
-// 환경변수(process.env)를 절대 사용하지 않고, Store에 저장된 사용자 입력 키를 강제로 사용합니다.
 const getClient = () => {
-  // 1. Store에서 사용자 입력 키 가져오기 (Source of Truth)
   const userKeyFromStore = useAppStore.getState().apiKey;
   
-  // 2. 키 존재 여부 확인 (없으면 실행 차단)
   if (!userKeyFromStore || typeof userKeyFromStore !== 'string' || userKeyFromStore.trim() === '') {
       console.error("⛔ [Gemini Service] No API Key found in store.");
       throw new Error("[AUTH_ERROR] API Key가 입력되지 않았습니다. 로그인 상태를 확인해주세요.");
   }
 
-  // 3. 키 포맷 재검증
   if (!userKeyFromStore.startsWith("AIza")) {
       console.error("⛔ [Gemini Service] Invalid API Key format.");
       throw new Error("[AUTH_ERROR] 유효하지 않은 API Key 형식입니다.");
   }
   
-  // 4. [LOGGING] 개발자 콘솔에서 내 키가 쓰이는지 확인 가능 (보안 로그)
-  // 이 로그는 사용자의 브라우저 콘솔에만 찍히며, 서버로 전송되지 않습니다.
-  console.log(`🔒 [Secure Mode] Requesting Google API with User Key: ...${userKeyFromStore.slice(-4)}`);
-
-  // 5. [FIX] 입력받은 키로 클라이언트 직접 생성 (환경변수 참조 제거)
   return new GoogleGenAI({ apiKey: userKeyFromStore });
 };
 
 // Error Handler
 const handleGeminiError = (error: any) => {
     const msg = (error.message || JSON.stringify(error)).toString();
-    console.error("Gemini API Error:", error);
+    console.error("Gemini API Error Detail:", error);
 
-    // AUTH Errors (Explicit)
+    // AUTH Errors
     if (msg.includes("expired")) {
-         throw new Error("🚨 [키 만료] 현재 사용 중인 API Key가 만료/삭제되었습니다. 로그아웃 후 새 키를 입력해주세요.");
+         throw new Error("🚨 [키 만료] API Key가 만료되었습니다. 새 키를 발급받아 입력해주세요.");
     }
 
     if (msg.includes("403") || msg.includes("API key") || msg.includes("API_KEY_INVALID") || msg.includes("PERMISSION_DENIED")) {
-        throw new Error("🚨 [권한 오류] 입력하신 API Key가 거부되었습니다. 올바른 키인지 확인하거나, Google Cloud 결제(Billing) 상태를 확인해주세요.");
+        throw new Error("🚨 [권한 거부] API Key 권한이 없거나 결제 계정이 연결되지 않았습니다. (Google Cloud Console 확인 필요)");
     }
     
     // Quota Errors
     if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
-         throw new Error("⚠️ [사용량 초과] 구글 무료 할당량을 모두 썼거나, 서버가 혼잡합니다. 1분 뒤 다시 시도해주세요.");
+         throw new Error("⚠️ [할당량 초과] 단시간에 너무 많은 요청을 보냈습니다. 1분 뒤 다시 시도해주세요.");
     }
     
     // Server/Model Errors
     if (msg.includes("503") || msg.includes("Overloaded") || msg.includes("Internal")) {
-        throw new Error("⚠️ Google AI 서버 트래픽이 폭주 중입니다. 잠시 후 다시 시도해주세요.");
+        // 503 is handled by retry logic, but if it leaks here:
+        throw new Error("⚠️ 구글 서버 과부하 상태입니다. 잠시 후 다시 시도해주세요.");
     }
 
-    // Not Found (Model Error)
+    // Model Not Found (Common with Pro/Preview models)
     if (msg.includes("404") || msg.includes("not found")) {
-        throw new Error("⚠️ [모델 오류] 지정된 AI 모델을 찾을 수 없습니다. (모델명 확인 필요)");
+        throw new Error("⚠️ [모델 미지원] 현재 API Key로는 해당 AI 모델(Gemini 3)을 사용할 수 없습니다.");
     }
     
     // Safety Errors
     if (msg.includes("SAFETY") || msg.includes("blocked")) {
-        throw new Error("⚠️ 안전 정책에 의해 생성이 차단되었습니다.");
+        throw new Error("⚠️ [안전 차단] 생성된 이미지가 안전 정책(성인/폭력 등)에 의해 차단되었습니다.");
     }
     
     // Fallback
-    throw new Error(`AI 요청 실패: ${msg.substring(0, 100)}...`);
+    throw new Error(`오류 발생: ${msg.substring(0, 100)}...`);
 };
 
-// --- RETRY WRAPPER ---
+// --- CLIENT-SIDE OPTIMIZATION ---
+// Resize image to max 1024px to reduce payload and server load
+const optimizeImageForAPI = (base64Str: string, maxDimension: number = 1024): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.src = base64Str.startsWith('data:') ? base64Str : `data:image/jpeg;base64,${base64Str}`;
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let width = img.width;
+            let height = img.height;
+
+            if (width > maxDimension || height > maxDimension) {
+                if (width > height) {
+                    height = Math.round((height *= maxDimension / width));
+                    width = maxDimension;
+                } else {
+                    width = Math.round((width *= maxDimension / height));
+                    height = maxDimension;
+                }
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                resolve(base64Str); // Fallback to original
+                return;
+            }
+            
+            ctx.drawImage(img, 0, 0, width, height);
+            // Compress to JPEG 0.8 quality
+            const optimized = canvas.toDataURL('image/jpeg', 0.8);
+            const clean = optimized.replace(/^data:image\/[a-z]+;base64,/, "");
+            console.log(`📉 Image Optimized: ${img.width}x${img.height} -> ${width}x${height}`);
+            resolve(clean);
+        };
+        img.onerror = (e) => {
+            console.warn("Image optimization failed, using original", e);
+            resolve(cleanBase64(base64Str));
+        };
+    });
+};
+
+// --- RETRY WRAPPER (Text) ---
 const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delayMs = 2000): Promise<T> => {
     let lastError: any;
     
@@ -84,63 +117,44 @@ const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delayMs = 
             lastError = error;
             const msg = (error.message || "").toString();
             
-            // 인증/권한 오류는 재시도해도 실패하므로 즉시 중단
-            if (msg.includes("AUTH_ERROR") || msg.includes("키 만료") || msg.includes("권한 오류") || msg.includes("SAFETY")) {
+            if (msg.includes("AUTH_ERROR") || msg.includes("키 만료") || msg.includes("권한") || msg.includes("SAFETY")) {
                 throw error;
             }
 
-            console.warn(`Attempt ${i + 1} failed. Retrying in ${delayMs}ms...`, msg);
+            console.warn(`Text Gen Attempt ${i + 1} failed. Retrying in ${delayMs}ms...`, msg);
             await new Promise(resolve => setTimeout(resolve, delayMs * (i + 1))); 
         }
     }
     throw lastError;
 };
 
-// --- VALIDATION (Direct Key Usage) ---
-// [FIX] 이 함수는 UI 입력창의 값을 인자로 직접 받아서 처리합니다.
+// --- VALIDATION ---
 export const validateGeminiKey = async (userInputKey: string): Promise<{ isValid: boolean; errorMsg?: string }> => {
-    // 0. Debug Log
-    // console.log("🔐 [Validation] Validating User Input Key:", userInputKey.slice(0, 5) + "...");
-
-    // 1. Basic string validation
     if (!userInputKey || !userInputKey.startsWith("AIza") || userInputKey.length < 30) {
         return { isValid: false, errorMsg: "API Key 형식이 올바르지 않습니다. (AIza로 시작해야 함)" };
     }
     
     try {
-        // 2. [CRITICAL] Initialize Client with USER INPUT KEY DIRECTLY
-        // 절대 process.env를 사용하지 않음.
         const ai = new GoogleGenAI({ apiKey: userInputKey });
-        
-        // 3. Validation Call using Flash model
         const response = await ai.models.generateContent({
             model: 'gemini-3-flash-preview', 
             contents: { parts: [{ text: 'ping' }] }
         });
         
         if (response?.text) {
-             console.log("✅ [Validation] Success. Key is valid.");
              return { isValid: true };
         } else {
-             return { isValid: false, errorMsg: "API 응답이 비어있습니다. 일시적인 오류일 수 있습니다." };
+             return { isValid: false, errorMsg: "응답 없음" };
         }
     } catch (e: any) {
-        console.error("❌ [Validation] Failed:", e);
+        console.error("Validation Failed:", e);
         const rawMsg = (e.message || JSON.stringify(e)).toLowerCase();
+        let friendlyMsg = "유효하지 않은 API Key입니다.";
         
-        let friendlyMsg = "유효하지 않은 API Key입니다. (Google 서버 거부)";
-        
-        if (rawMsg.includes("expired")) {
-            friendlyMsg = "🚨 [만료된 키] 입력하신 키는 삭제되었거나 만료되었습니다. (새 키 발급 필요)";
-        } else if (rawMsg.includes("key_invalid") || rawMsg.includes("bad request") || rawMsg.includes("api key not valid")) {
-             friendlyMsg = "🚨 [잘못된 키] API Key가 존재하지 않습니다. 복사 과정에서 잘렸는지 확인해주세요.";
-        } else if (rawMsg.includes("permission_denied") || rawMsg.includes("403")) {
-             friendlyMsg = "🚨 [권한 없음] 입력한 키로 AI 모델에 접근할 수 없습니다. (결제 계정 연동 확인)";
-        } else if (rawMsg.includes("quota")) {
-             friendlyMsg = "🚨 [할당량 초과] 해당 키의 사용량이 이미 초과되었습니다.";
-        } else if (rawMsg.includes("not found") || rawMsg.includes("404")) {
-             friendlyMsg = "⚠️ [모델 오류] Gemini 3 Flash 모델에 접근할 수 없습니다.";
-        }
+        if (rawMsg.includes("expired")) friendlyMsg = "🚨 만료된 키입니다.";
+        else if (rawMsg.includes("key_invalid")) friendlyMsg = "🚨 존재하지 않는 키입니다.";
+        else if (rawMsg.includes("permission_denied")) friendlyMsg = "🚨 권한이 없는 키입니다.";
+        else if (rawMsg.includes("not found")) friendlyMsg = "⚠️ 모델 접근 불가 (Gemini 3 Flash)";
         
         return { isValid: false, errorMsg: friendlyMsg };
     }
@@ -161,12 +175,113 @@ const cleanJson = (text: string) => {
   return clean.trim();
 };
 
-// --- THUMBNAIL SERVICES ---
+// --- CORE IMAGE GENERATION (With Intelligent Retry & Callback) ---
+// Features: Exponential Backoff, Fallback Models, Status Callback
+const generateImage = async (
+    mimeType: string, 
+    cleanData: string, 
+    prompt: string, 
+    imageConfig: any = {},
+    onStatusUpdate?: (msg: string) => void
+): Promise<string> => {
+    const ai = getClient();
+    
+    // Models to try in order
+    const modelsToTry = [
+        'gemini-3-pro-image-preview', // Priority 1: High Quality
+        'gemini-2.5-flash-image'      // Priority 2: General/Fast
+    ];
+
+    // Retry Delays: 5s, 10s, 20s, 40s, 60s
+    const retryDelays = [5000, 10000, 20000, 40000, 60000];
+
+    let lastError: any = null;
+
+    for (const modelName of modelsToTry) {
+        
+        // Retry Loop for 503/429 errors
+        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+            try {
+                if (onStatusUpdate) {
+                    if (attempt === 0) onStatusUpdate(`🎨 모델(${modelName.includes('pro') ? 'Pro' : 'Fast'})로 이미지 생성 시작...`);
+                    else onStatusUpdate(`⏳ 구글 서버 대기 중... ${retryDelays[attempt-1]/1000}초 후 재시도 (${attempt}/${retryDelays.length})`);
+                }
+
+                // If this is a retry, wait before calling
+                if (attempt > 0) {
+                    await new Promise(resolve => setTimeout(resolve, retryDelays[attempt - 1]));
+                }
+                
+                // [Optimization] Optimize image size right before call if logic allows, 
+                // but we do it outside this loop to avoid re-optimizing. 
+                // Assuming cleanData is passed already optimized or raw.
+
+                console.log(`🎨 Attempt ${attempt+1}: Generating image using ${modelName}`);
+                
+                const response = await ai.models.generateContent({
+                    model: modelName,
+                    contents: {
+                        parts: [
+                            { inlineData: { mimeType: mimeType, data: cleanData } },
+                            { text: prompt }
+                        ]
+                    },
+                    config: {
+                        imageConfig: {
+                            aspectRatio: imageConfig.aspectRatio || "1:1",
+                            ...(modelName.includes('pro') ? { imageSize: imageConfig.imageSize || "1K" } : {})
+                        }
+                    }
+                });
+
+                if (response.candidates && response.candidates.length > 0) {
+                    for (const part of response.candidates[0].content.parts) {
+                        if (part.inlineData && part.inlineData.data) {
+                            const mime = part.inlineData.mimeType || 'image/png';
+                            return `data:${mime};base64,${part.inlineData.data}`;
+                        }
+                    }
+                }
+                throw new Error("Empty image response");
+
+            } catch (e: any) {
+                lastError = e;
+                const msg = (e.message || "").toLowerCase();
+                
+                // Critical Errors -> Break Model Loop (Try next model or fail)
+                if (msg.includes("auth") || msg.includes("key") || msg.includes("permission") || msg.includes("safety") || msg.includes("blocked")) {
+                    throw e; // Don't retry these errors
+                }
+
+                // Retryable Errors (503, 429, Overloaded)
+                if (msg.includes("503") || msg.includes("overloaded") || msg.includes("quota") || msg.includes("internal") || msg.includes("429")) {
+                     console.warn(`⚠️ Attempt ${attempt + 1} failed (${modelName}):`, msg);
+                     // Continue to next iteration of retry loop
+                     continue;
+                }
+                
+                // If 404 (Model not found), break retry loop and try next model immediately
+                if (msg.includes("404") || msg.includes("not found")) {
+                    break; 
+                }
+
+                // Unknown error -> Break retry loop
+                break;
+            }
+        }
+        // If we exhausted retries for this model, try the next model
+    }
+
+    // If all failed
+    throw lastError || new Error("모든 이미지 생성 모델 시도 실패 (구글 서버 혼잡)");
+};
+
+// --- EXPORTED FUNCTIONS ---
+
 // 분석: gemini-3-flash-preview
 export const analyzeForThumbnail = async (base64Image: string): Promise<{ detectionReport: string; generationPrompt: string; seoTip: string; }> => {
     return withRetry(async () => {
         try {
-            // [FIX] Store의 키를 사용하는 getClient 호출
             const ai = getClient();
             const cleanData = cleanBase64(base64Image);
             
@@ -202,25 +317,19 @@ export const analyzeForThumbnail = async (base64Image: string): Promise<{ detect
     });
 };
 
-// 생성: gemini-3-pro-image-preview
 export const generateThumbnailImage = async (base64Image: string, promptText: string): Promise<string> => {
     try {
         const cleanData = cleanBase64(base64Image);
+        // Optimization for Thumbnail
+        const optimizedData = await optimizeImageForAPI(cleanData, 1024);
+        
         const finalPrompt = `${promptText} \n [STRICT] Keep product exactly as is. Replace background. No text overlays.`;
-        // Use Pro for Image Generation
-        return await generateImage('image/jpeg', cleanData, finalPrompt, { aspectRatio: '1:1', imageSize: '2K' });
+        return await generateImage('image/jpeg', optimizedData, finalPrompt, { aspectRatio: '1:1', imageSize: '1K' });
     } catch (e) {
         return handleGeminiError(e);
     }
 };
 
-// --- PHASE 3 ENGINE ---
-
-export const forceExtractAllChineseText = async (base64Image: string): Promise<string[]> => {
-    return [];
-};
-
-// 분석 및 카피라이팅: gemini-3-flash-preview
 export const analyzeAndGenerateCopywriting = async (
     base64Target: string, 
     prextractedTexts: string[],
@@ -234,7 +343,6 @@ export const analyzeAndGenerateCopywriting = async (
 }> => {
     return withRetry(async () => {
         try {
-            // [FIX] Store의 키를 사용하는 getClient 호출
             const ai = getClient();
             const targetData = cleanBase64(base64Target);
             
@@ -248,51 +356,22 @@ export const analyzeAndGenerateCopywriting = async (
             }
             contextParts.push({ inlineData: { mimeType: 'image/jpeg', data: targetData } });
 
-            // --- Negative Prompt ---
             let negativePrompt = "";
             if (usedCaptions.length > 0) {
                 const recentUsed = usedCaptions.slice(-50).join(", ");
-                negativePrompt = `
-    # 🚫 ANTI-DUPLICATION RULES
-    Do NOT use these phrases: [ ${recentUsed} ]
-    Generate NEW expressions.
-                `;
+                negativePrompt = `Do NOT use these phrases: [ ${recentUsed} ]`;
             }
 
             const legacyPrompt = `
     # Role: Cross-Border E-commerce Copywriter (Chinese -> Korean)
     # Task: Generate 8 distinct Korean copywriting options.
-
     ${negativePrompt}
-
-    # Rules
-    1. Target: Background text, speech bubbles.
-    2. Ignore: Logos, Model numbers.
-    3. Output: JSON array of strings ONLY. No prefixes.
-
-    # Options Structure
-    1-2: Direct/Benefit
-    3-5: Emotional/Question/Premium (Use \\n)
-    6-8: Hooks (Relief/Benefit/Impact) (Use \\n)
-
-    # Output Format (JSON Only)
-    {
-    "type": "object",
-    "properties": {
-        "options": {
-        "type": "array",
-        "items": { "type": "string" },
-        "minItems": 8,
-        "maxItems": 8
-        }
-    },
-    "required": ["options"]
-    }
+    # Output: JSON array of strings ONLY. No prefixes.
+    # Output Format: {"options": ["...", ...]}
     `;
 
             contextParts.push({ text: legacyPrompt });
 
-            // Use Gemini 3 Flash for logic
             const response = await ai.models.generateContent({
                 model: 'gemini-3-flash-preview', 
                 contents: { parts: contextParts },
@@ -303,22 +382,14 @@ export const analyzeAndGenerateCopywriting = async (
             let optionsList: string[] = rawResult.options || [];
 
             const toneMap = [
-                "1. 직역/스펙 (정확성)",
-                "2. 핵심 이점 (문제 해결)",
-                "3. 감성 공감 (공간/휴식)",
-                "4. 질문 & 해결 (고충 해결)",
-                "5. 프리미엄 (압도적 성능)",
-                "6. 안심 후킹 (불안 해소)",
-                "7. 욕망 후킹 (삶의 변화)",
-                "8. 임팩트/반전 (강력한 한방)"
+                "1. 직역/스펙", "2. 핵심 이점", "3. 감성 공감", "4. 질문 & 해결",
+                "5. 프리미엄", "6. 안심 후킹", "7. 욕망 후킹", "8. 임팩트/반전"
             ];
             
             const aggregatedOptions: CopywritingOption[] = [];
-            
             for (let i = 0; i < 8; i++) {
-                let cleanText = optionsList[i] || "(생성된 텍스트 없음)";
+                let cleanText = optionsList[i] || "";
                 cleanText = cleanText.replace(/^(Option\s?\d+|옵션\s?\d+|\d+)\s?[:.]\s?/i, "").trim();
-
                 aggregatedOptions.push({
                     index: i + 1,
                     tone: toneMap[i] || `Option ${i+1}`,
@@ -328,33 +399,10 @@ export const analyzeAndGenerateCopywriting = async (
             }
 
             return {
-                analysisStage: {
-                    chinese_text_count: 0,
-                    boxes_and_tables_detected: 0,
-                    boxes_and_tables: [],
-                    warning: "Legacy Mode Active"
-                },
-                renderingPreservation: {
-                    boxes_preserved: true,
-                    table_structure_preserved: true,
-                    cell_structure_preserved: true,
-                    font_sizes_maintained: true,
-                    colors_maintained: true,
-                    backgrounds_maintained: true,
-                    opacity_maintained: true,
-                    positions_maintained: true,
-                    borders_maintained: true
-                },
+                analysisStage: { chinese_text_count: 0, boxes_and_tables_detected: 0, boxes_and_tables: [], warning: "Legacy Mode" },
+                renderingPreservation: { boxes_preserved: true, table_structure_preserved: true, cell_structure_preserved: true, font_sizes_maintained: true, colors_maintained: true, backgrounds_maintained: true, opacity_maintained: true, positions_maintained: true, borders_maintained: true },
                 copywriting: aggregatedOptions,
-                validation: {
-                    boxes_and_tables_detected: true,
-                    all_box_texts_recognized: true,
-                    box_structure_safe: true,
-                    no_box_text_deleted: true,
-                    rendering_safe: true,
-                    coordinates_recorded: true,
-                    ready_for_image_gen: true
-                }
+                validation: { boxes_and_tables_detected: true, all_box_texts_recognized: true, box_structure_safe: true, no_box_text_deleted: true, rendering_safe: true, coordinates_recorded: true, ready_for_image_gen: true }
             };
         } catch (e) {
             throw e; 
@@ -364,145 +412,65 @@ export const analyzeAndGenerateCopywriting = async (
     });
 };
 
-export const analyzeImageForCopywriting = async (
-    base64Image: string, 
-    referenceImage?: string | null,
-    usedCaptions: string[] = [] 
-): Promise<CopywritingOption[]> => {
+export const analyzeImageForCopywriting = async (base64Image: string, referenceImage?: string | null, usedCaptions: string[] = []) => {
     const result = await analyzeAndGenerateCopywriting(base64Image, [], referenceImage, usedCaptions);
     return result.copywriting;
 };
 
-// [Step B] Image Generation: Uses Pro
+export const applyCopywritingToImage = async (base64Image: string, selectedOption: CopywritingOption, isRetry: boolean = false): Promise<string> => {
+    // This is now a wrapper that might be unused if we call generateDetailPageImage directly
+    return generateDetailPageImage(base64Image, selectedOption, []);
+};
+
+// [UPDATED] Detailed Page Generation with Optimization and Status Callback
 export const generateDetailPageImage = async (
     base64Image: string, 
-    selectedOption: CopywritingOption,
-    recognizedChineseTexts: string[] 
+    selectedOption: CopywritingOption, 
+    recognizedChineseTexts: string[],
+    onStatusUpdate?: (msg: string) => void
 ): Promise<string> => {
     try {
-        const cleanData = cleanBase64(base64Image);
+        if (onStatusUpdate) onStatusUpdate("⚡ 이미지 최적화 및 압축 중...");
         
-        let prompt = "";
-        const commonProtocol = `
-        # 🛡️ PRODUCT PRESERVATION PROTOCOL
-        1. Keep Product Integrity 100%.
-        2. Replace Chinese text with Korean text inside boxes.
-        3. If text overlaps product, use high-contrast text box (Yellow/Black).
+        const cleanData = cleanBase64(base64Image);
+        // Optimize: Resize to 1024px max before sending
+        const optimizedData = await optimizeImageForAPI(cleanData, 1024);
+        
+        const prompt = `
+        Task: E-commerce Localization (Chinese -> Korean).
+        User Copy: "${selectedOption.text}"
+        Rules: Replace Chinese text with Korean. Keep product integrity. High contrast text.
         `;
-
-        if (selectedOption.replacements && selectedOption.replacements.length > 0) {
-            // V4 Logic
-            const replacementInstructions = selectedOption.replacements.map((r, idx) => {
-                return `
-                [Replace ${idx}] Coords: [${r.bounding_box.join(', ')}]
-                Orig: "${r.original}" -> New: "${r.replacement.replace(/\n/g, ' ')}"
-                Color: ${r.properties.text_color}, BG: ${r.properties.background_color}
-                `;
-            }).join('\n');
-
-            prompt = `Task: Localize Product Image. ${replacementInstructions} ${commonProtocol}`;
-        } else {
-            // Legacy Logic
-            prompt = `
-            Task: E-commerce Localization (Chinese -> Korean).
-            User Copy: "${selectedOption.text}"
-            
-            Rules:
-            1. Marketing Text: Replace with User Copy.
-            2. Specs/Tables: Direct Translation. Preserve numbers/units.
-            ${commonProtocol}
-            Design: Black/White/Yellow text. High contrast. Modern Font.
-            `;
-        }
-
-        return await generateImage('image/jpeg', cleanData, prompt);
+        
+        return await generateImage('image/jpeg', optimizedData, prompt, {}, onStatusUpdate);
     } catch (e) {
         return handleGeminiError(e);
     }
-};
-
-export const applyCopywritingToImage = async (base64Image: string, selectedOption: CopywritingOption, isRetry: boolean = false): Promise<string> => {
-    return generateDetailPageImage(base64Image, selectedOption, []);
 };
 
 export const swapFaceInImage = async (base64Image: string): Promise<string> => {
   try {
       const cleanData = cleanBase64(base64Image);
-      const prompt = `Face Swap: Replace human face with Western/Caucasian model. Keep age/gender same. Do not touch text/product.`;
-      return await generateImage('image/jpeg', cleanData, prompt);
+      // Optimize
+      const optimizedData = await optimizeImageForAPI(cleanData, 1024);
+      const prompt = `Face Swap: Replace human face with Western/Caucasian model. Keep age/gender same.`;
+      return await generateImage('image/jpeg', optimizedData, prompt);
   } catch (e) {
       return handleGeminiError(e);
   }
 };
 
-export const editImagePartially = async (
-    base64Image: string, 
-    userPrompt: string, 
-    box: { ymin: number, xmin: number, ymax: number, xmax: number }
-): Promise<string> => {
+export const editImagePartially = async (base64Image: string, userPrompt: string, box: any): Promise<string> => {
     try {
         const cleanData = cleanBase64(base64Image);
-        const prompt = `
-        Magic Repair. Region: y_min:${box.ymin}, x_min:${box.xmin}, y_max:${box.ymax}, x_max:${box.xmax}.
-        Instruction: "${userPrompt}"
-        Rule: Modify ONLY inside region. Seamless inpainting.
-        `;
-        return await generateImage('image/jpeg', cleanData, prompt);
+        // For inpainting, we might want to keep original resolution if possible, 
+        // but 503 is a bigger issue. Let's optimize slightly less aggressively or keep as is.
+        // Let's use 1024 for stability.
+        const optimizedData = await optimizeImageForAPI(cleanData, 1024);
+
+        const prompt = `Magic Repair. Region: [${box.ymin}, ${box.xmin}, ${box.ymax}, ${box.xmax}]. Instruction: "${userPrompt}"`;
+        return await generateImage('image/jpeg', optimizedData, prompt);
     } catch (e) {
         return handleGeminiError(e);
     }
-};
-
-// [CRITICAL] Core Image Generation Function
-// This function strictly enforces the use of the Pro model for high-quality image generation.
-const generateImage = async (mimeType: string, cleanData: string, prompt: string, imageConfig: any = {}): Promise<string> => {
-    let lastError: any = null;
-    const maxAttempts = 3; 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        // [FIX] Store의 키를 사용하는 getClient 호출
-        const ai = getClient();
-        
-        // [CRITICAL] Fixed to Pro model for high quality as requested
-        // Using 'gemini-3-pro-image-preview' which is the correct API ID for the Pro Image model.
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-pro-image-preview', // Fixed to Pro model for high quality
-            contents: {
-                parts: [
-                    { inlineData: { mimeType: mimeType, data: cleanData } },
-                    { text: prompt }
-                ]
-            },
-            config: {
-                imageConfig: {
-                    aspectRatio: imageConfig.aspectRatio || "1:1",
-                    imageSize: imageConfig.imageSize || "1K"
-                }
-            }
-        });
-
-        if (response.candidates && response.candidates.length > 0) {
-            for (const part of response.candidates[0].content.parts) {
-                if (part.inlineData && part.inlineData.data) {
-                    const mime = part.inlineData.mimeType || 'image/png';
-                    return `data:${mime};base64,${part.inlineData.data}`;
-                }
-            }
-        }
-        
-        throw new Error("이미지 생성 결과가 없습니다.");
-
-      } catch (e: any) {
-        lastError = e;
-        const msg = e.toString();
-        // Retry on quota/server errors
-        if ((msg.includes("429") || msg.includes("503") || msg.includes("Internal")) && attempt < maxAttempts) {
-             console.log(`Image generation attempt ${attempt} failed. Retrying...`);
-             await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-             continue;
-        }
-        break; 
-      }
-    }
-    throw lastError || new Error("이미지 생성 실패");
 };
