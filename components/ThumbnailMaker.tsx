@@ -1,20 +1,29 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
-import { analyzeForThumbnail, generateThumbnailImage } from '../services/geminiService';
+import { analyzeForThumbnail, generateThumbnailImage, editImagePartially } from '../services/geminiService';
 
 export const ThumbnailMaker: React.FC = () => {
     const { 
         thumbnail, setThumbnailImage, updateThumbnail, skipThumbnail, resetThumbnail,
-        setGlobalError, logUsage, logout, checkSession // checkSession added
+        setGlobalError, logUsage, logout, checkSession 
     } = useAppStore();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [isDragging, setIsDragging] = useState(false);
 
+    // --- Magic Repair State ---
+    const [isRepairMode, setIsRepairMode] = useState(false);
+    const [isDrawing, setIsDrawing] = useState(false);
+    const [startPos, setStartPos] = useState<{x: number, y: number} | null>(null);
+    const [currentPos, setCurrentPos] = useState<{x: number, y: number} | null>(null);
+    const [finalBox, setFinalBox] = useState<{x: number, y: number, w: number, h: number} | null>(null);
+    const [repairPrompt, setRepairPrompt] = useState("");
+    const [isRepairing, setIsRepairing] = useState(false);
+    const imageRef = useRef<HTMLImageElement>(null);
+
     // Paste Event Handler
     useEffect(() => {
         const handlePaste = (e: ClipboardEvent) => {
-            // Processing 중에는 붙여넣기 방지
-            if (thumbnail.status === 'analyzing' || thumbnail.status === 'generating') return;
+            if (thumbnail.status === 'analyzing' || thumbnail.status === 'generating' || isRepairMode) return;
 
             const items = e.clipboardData?.items;
             if (!items) return;
@@ -31,7 +40,7 @@ export const ThumbnailMaker: React.FC = () => {
                             processThumbnail(result);
                         };
                         reader.readAsDataURL(blob);
-                        return; // 첫 번째 이미지만 처리
+                        return; 
                     }
                 }
             }
@@ -39,7 +48,7 @@ export const ThumbnailMaker: React.FC = () => {
 
         window.addEventListener('paste', handlePaste);
         return () => window.removeEventListener('paste', handlePaste);
-    }, [thumbnail.status]); // status 의존성 추가
+    }, [thumbnail.status, isRepairMode]);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
@@ -67,13 +76,11 @@ export const ThumbnailMaker: React.FC = () => {
     };
 
     const processThumbnail = async (imageSrc: string) => {
-        // [Security] 세션 유효성 검사
         const isSessionValid = await checkSession();
-        if (!isSessionValid) return; // 유효하지 않으면 중단 (checkSession 내부에서 로그아웃됨)
+        if (!isSessionValid) return;
 
         updateThumbnail({ status: 'analyzing', error: undefined });
         try {
-            // Step 1: Analyze
             const analysis = await analyzeForThumbnail(imageSrc);
             updateThumbnail({ 
                 status: 'generating', 
@@ -82,7 +89,6 @@ export const ThumbnailMaker: React.FC = () => {
                 generationPrompt: analysis.generationPrompt 
             });
 
-            // Step 2: Generate
             if (analysis.generationPrompt) {
                 const genImage = await generateThumbnailImage(imageSrc, analysis.generationPrompt);
                 updateThumbnail({ status: 'complete', generatedImage: genImage });
@@ -114,7 +120,6 @@ export const ThumbnailMaker: React.FC = () => {
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             
-            // 좌우 반전 로직
             ctx.translate(canvas.width, 0);
             ctx.scale(-1, 1);
             ctx.drawImage(img, 0, 0);
@@ -132,6 +137,77 @@ export const ThumbnailMaker: React.FC = () => {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+    };
+
+    // --- Magic Repair Handlers ---
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        if (!isRepairMode) return;
+        e.preventDefault();
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        setStartPos({ x, y });
+        setCurrentPos({ x, y });
+        setIsDrawing(true);
+        setFinalBox(null); 
+    };
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+        if (!isDrawing || !startPos) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        setCurrentPos({ x, y });
+    };
+
+    const handleMouseUp = (e: React.MouseEvent) => {
+        if (!isDrawing || !startPos || !currentPos) return;
+        setIsDrawing(false);
+        
+        const x = Math.min(startPos.x, currentPos.x);
+        const y = Math.min(startPos.y, currentPos.y);
+        const w = Math.abs(currentPos.x - startPos.x);
+        const h = Math.abs(currentPos.y - startPos.y);
+
+        if (w > 10 && h > 10) {
+            setFinalBox({ x, y, w, h });
+        } else {
+            setFinalBox(null);
+        }
+        setStartPos(null);
+        setCurrentPos(null);
+    };
+
+    const executeMagicRepair = async () => {
+        if (!finalBox || !repairPrompt.trim() || !thumbnail.generatedImage) return;
+        setIsRepairing(true);
+        
+        const imgElement = imageRef.current;
+        if (!imgElement) return;
+
+        const displayW = imgElement.offsetWidth;
+        const displayH = imgElement.offsetHeight;
+        
+        const normBox = {
+            ymin: Math.round((finalBox.y / displayH) * 1000),
+            xmin: Math.round((finalBox.x / displayW) * 1000),
+            ymax: Math.round(((finalBox.y + finalBox.h) / displayH) * 1000),
+            xmax: Math.round(((finalBox.x + finalBox.w) / displayW) * 1000)
+        };
+
+        try {
+            const newImage = await editImagePartially(thumbnail.generatedImage, repairPrompt, normBox);
+            updateThumbnail({ generatedImage: newImage });
+            setFinalBox(null); // Reset box for next edit
+            setRepairPrompt("");
+            await logUsage();
+        } catch (e: any) {
+            const msg = e.message || e.toString();
+            setGlobalError(msg);
+        } finally {
+            setIsRepairing(false);
+        }
     };
 
     return (
@@ -175,7 +251,11 @@ export const ThumbnailMaker: React.FC = () => {
                             <div className="relative rounded-xl overflow-hidden border border-slate-200 shadow-sm bg-white mb-6 group">
                                 <img src={thumbnail.originalImage} className="w-full max-h-[300px] object-contain" alt="Original" />
                                 <div className="absolute top-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded">원본</div>
-                                <button onClick={resetThumbnail} className="absolute top-2 right-2 bg-white/90 p-1.5 rounded-full hover:bg-red-100 text-red-500 shadow-sm">✕</button>
+                                <button 
+                                    onClick={resetThumbnail} 
+                                    disabled={isRepairing}
+                                    className="absolute top-2 right-2 bg-white/90 p-1.5 rounded-full hover:bg-red-100 text-red-500 shadow-sm"
+                                >✕</button>
                             </div>
 
                             {/* Analysis Console */}
@@ -231,29 +311,121 @@ export const ThumbnailMaker: React.FC = () => {
 
                     {thumbnail.status === 'complete' && thumbnail.generatedImage && (
                         <div className="w-full flex flex-col items-center animate-fade-in-up">
-                            <div className="relative w-full aspect-square max-w-[450px] shadow-2xl rounded-xl overflow-hidden border border-slate-100 group">
-                                <img src={thumbnail.generatedImage} className="w-full h-full object-contain bg-white" alt="Generated Thumbnail" />
-                                <div className="absolute top-4 left-4 bg-green-500 text-white px-3 py-1 rounded-full text-sm font-bold shadow-lg">
-                                    SEO 최적화 완료
-                                </div>
+                            <div 
+                                className={`relative w-full aspect-square max-w-[450px] shadow-2xl rounded-xl overflow-hidden border border-slate-100 group ${isRepairMode ? 'cursor-crosshair ring-2 ring-indigo-500' : ''}`}
+                                onMouseDown={handleMouseDown}
+                                onMouseMove={handleMouseMove}
+                                onMouseUp={handleMouseUp}
+                                onMouseLeave={() => isDrawing && setIsDrawing(false)}
+                            >
+                                <img 
+                                    ref={imageRef}
+                                    src={thumbnail.generatedImage} 
+                                    className="w-full h-full object-contain bg-white select-none" 
+                                    alt="Generated Thumbnail" 
+                                    draggable={false}
+                                />
+                                
+                                {/* Status Badge */}
+                                {!isRepairMode && (
+                                    <div className="absolute top-4 left-4 bg-green-500 text-white px-3 py-1 rounded-full text-sm font-bold shadow-lg">
+                                        SEO 최적화 완료
+                                    </div>
+                                )}
+
+                                {/* Repair Mode Overlay */}
+                                {isRepairMode && (
+                                    <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-indigo-600/90 backdrop-blur text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg pointer-events-none animate-fade-in">
+                                        ✂️ 수정할 영역을 드래그하세요
+                                    </div>
+                                )}
+
+                                {/* Drawing Box */}
+                                {isDrawing && startPos && currentPos && (
+                                    <div 
+                                        className="absolute border-2 border-red-500 bg-red-500/20 z-20"
+                                        style={{
+                                            left: Math.min(startPos.x, currentPos.x),
+                                            top: Math.min(startPos.y, currentPos.y),
+                                            width: Math.abs(currentPos.x - startPos.x),
+                                            height: Math.abs(currentPos.y - startPos.y)
+                                        }}
+                                    ></div>
+                                )}
+
+                                {/* Magic Repair Input Popup */}
+                                {finalBox && (
+                                    <div 
+                                        className="absolute bg-white rounded-xl shadow-2xl p-3 z-30 flex flex-col gap-2 min-w-[280px] border border-slate-200 animate-fade-in-up"
+                                        style={{
+                                            top: Math.min(finalBox.y + finalBox.h + 10, imageRef.current?.offsetHeight ? imageRef.current.offsetHeight - 120 : 0),
+                                            left: Math.min(finalBox.x, imageRef.current?.offsetWidth ? imageRef.current.offsetWidth - 280 : 0)
+                                        }}
+                                        onMouseDown={e => e.stopPropagation()} 
+                                    >
+                                        <div className="flex justify-between items-center text-xs font-bold text-slate-700">
+                                            <span>🪄 부분 수정 (Magic Repair)</span>
+                                            <button onClick={() => setFinalBox(null)} className="text-slate-400 hover:text-slate-600">✕</button>
+                                        </div>
+                                        <input 
+                                            type="text" 
+                                            autoFocus
+                                            className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                                            placeholder="예: 글자 지워줘, 손가락 수정해줘"
+                                            value={repairPrompt}
+                                            onChange={e => setRepairPrompt(e.target.value)}
+                                            onKeyDown={e => e.key === 'Enter' && executeMagicRepair()}
+                                        />
+                                        <button 
+                                            onClick={executeMagicRepair}
+                                            disabled={isRepairing || !repairPrompt.trim()}
+                                            className={`w-full py-2 rounded-lg text-xs font-bold text-white transition-colors ${isRepairing ? 'bg-slate-400 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+                                        >
+                                            {isRepairing ? 'AI 수정 중...' : '수정 실행'}
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                             
-                            <div className="flex gap-3 mt-8 flex-wrap justify-center">
+                            <div className="flex gap-3 mt-8 flex-wrap justify-center items-center">
                                 <button 
                                     onClick={handleDownload}
-                                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-3 rounded-xl font-bold shadow-lg flex items-center gap-2 transform transition hover:-translate-y-1"
+                                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg flex items-center gap-2 transform transition hover:-translate-y-1 disabled:opacity-50"
+                                    disabled={isRepairMode}
                                 >
                                     <span>💾 다운로드</span>
                                 </button>
                                 <button 
                                     onClick={handleFlip}
-                                    className="bg-white border border-slate-300 text-slate-700 px-5 py-3 rounded-xl font-bold hover:bg-slate-50 shadow-sm transition"
+                                    className="bg-white border border-slate-300 text-slate-700 px-4 py-3 rounded-xl font-bold hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+                                    disabled={isRepairMode}
                                 >
                                     ↔️ 좌우 반전
                                 </button>
+
+                                {/* Magic Repair Toggle Button */}
+                                <button 
+                                    onClick={() => {
+                                        setIsRepairMode(!isRepairMode);
+                                        setFinalBox(null);
+                                    }}
+                                    className={`px-5 py-3 rounded-xl font-bold shadow-sm transition flex items-center gap-2 border ${
+                                        isRepairMode 
+                                        ? 'bg-indigo-100 border-indigo-300 text-indigo-700 ring-2 ring-indigo-200' 
+                                        : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                                    }`}
+                                >
+                                    {isRepairMode ? (
+                                        <><span>✓ 수정 완료</span></>
+                                    ) : (
+                                        <><span>🪄 부분 수정</span></>
+                                    )}
+                                </button>
+
                                 <button 
                                     onClick={skipThumbnail}
-                                    className="bg-white border border-slate-300 text-slate-600 px-6 py-3 rounded-xl font-bold hover:bg-slate-50"
+                                    className="bg-white border border-slate-300 text-slate-600 px-6 py-3 rounded-xl font-bold hover:bg-slate-50 disabled:opacity-50"
+                                    disabled={isRepairMode}
                                 >
                                     다음 단계로 →
                                 </button>
