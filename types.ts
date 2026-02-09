@@ -1,4 +1,5 @@
 
+
 // 텍스트 속성 (공통)
 export interface TextProperties {
   font_size: string;
@@ -103,6 +104,7 @@ export interface ThumbnailData {
   analysisReport: string | null;
   seoTip: string | null;
   generationPrompt: string | null;
+  error?: string | null;
 }
 
 export interface AppState {
