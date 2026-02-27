@@ -188,8 +188,8 @@ const generateImage = async (
     
     // Models to try in order
     const modelsToTry = [
-        'gemini-3-pro-image-preview', // Priority 1: High Quality
-        'gemini-2.5-flash-image'      // Priority 2: General/Fast
+        'gemini-3.1-flash-image-preview', // Priority 1: High Quality (New)
+        'gemini-2.5-flash-image'          // Priority 2: General/Fast
     ];
 
     // Retry Delays: 5s, 10s, 20s, 40s, 60s
@@ -203,7 +203,7 @@ const generateImage = async (
         for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
             try {
                 if (onStatusUpdate) {
-                    if (attempt === 0) onStatusUpdate(`🎨 모델(${modelName.includes('pro') ? 'Pro' : 'Fast'})로 이미지 생성 시작...`);
+                    if (attempt === 0) onStatusUpdate(`🎨 모델(${modelName.includes('3.1') ? '3.1 Flash' : (modelName.includes('pro') ? 'Pro' : 'Fast')})로 이미지 생성 시작...`);
                     else onStatusUpdate(`⏳ 구글 서버 대기 중... ${retryDelays[attempt-1]/1000}초 후 재시도 (${attempt}/${retryDelays.length})`);
                 }
 
@@ -229,7 +229,7 @@ const generateImage = async (
                     config: {
                         imageConfig: {
                             aspectRatio: imageConfig.aspectRatio || "1:1",
-                            ...(modelName.includes('pro') ? { imageSize: imageConfig.imageSize || "1K" } : {})
+                            ...( (modelName.includes('pro') || modelName.includes('3.1')) ? { imageSize: imageConfig.imageSize || "1K" } : {})
                         }
                     }
                 });
