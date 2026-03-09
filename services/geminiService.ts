@@ -422,6 +422,40 @@ export const applyCopywritingToImage = async (base64Image: string, selectedOptio
     return generateDetailPageImage(base64Image, selectedOption, []);
 };
 
+// --- 원본 이미지 비율 자동 계산 함수 ---
+const determineAspectRatio = (base64Str: string): Promise<string> => {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            const ratio = img.width / img.height;
+            // Gemini 모델이 지원하는 비율 목록
+            const supported = [
+                { name: "1:1", val: 1.0 },
+                { name: "4:3", val: 4/3 },
+                { name: "3:4", val: 3/4 },
+                { name: "16:9", val: 16/9 },
+                { name: "9:16", val: 9/16 },
+                { name: "4:1", val: 4/1 },
+                { name: "1:4", val: 1/4 }
+            ];
+            // 원본과 가장 가까운 비율 찾기
+            let closest = supported[0];
+            let minDiff = Math.abs(ratio - supported[0].val);
+            for (const s of supported) {
+                const diff = Math.abs(ratio - s.val);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    closest = s;
+                }
+            }
+            console.log(`📏 원본 비율: ${img.width}x${img.height} (${ratio.toFixed(2)}) -> 적용 비율: ${closest.name}`);
+            resolve(closest.name);
+        };
+        img.onerror = () => resolve("1:1"); // 에러 시 기본값
+        img.src = base64Str.startsWith('data:') ? base64Str : `data:image/jpeg;base64,${base64Str}`;
+    });
+};
+
 // [UPDATED] Detailed Page Generation with Optimization and Status Callback
 export const generateDetailPageImage = async (
     base64Image: string, 
@@ -430,10 +464,14 @@ export const generateDetailPageImage = async (
     onStatusUpdate?: (msg: string) => void
 ): Promise<string> => {
     try {
-        if (onStatusUpdate) onStatusUpdate("⚡ 이미지 최적화 및 압축 중...");
+        if (onStatusUpdate) onStatusUpdate("⚡ 이미지 비율 분석 및 최적화 중...");
         
         const cleanData = cleanBase64(base64Image);
-        // Optimize: Resize to 1024px max before sending
+        
+        // 1. 원본 이미지의 비율을 분석해서 가장 가까운 지원 비율 찾기
+        const targetRatio = await determineAspectRatio(cleanData);
+        
+        // 2. Optimize: Resize to 1024px max before sending
         const optimizedData = await optimizeImageForAPI(cleanData, 1024);
         
         const prompt = `
@@ -442,7 +480,8 @@ export const generateDetailPageImage = async (
         Rules: Replace Chinese text with Korean. Keep product integrity. High contrast text.
         `;
         
-        return await generateImage('image/jpeg', optimizedData, prompt, {}, onStatusUpdate);
+        // 3. 분석된 원본 비율(targetRatio)을 적용하여 생성 요청
+        return await generateImage('image/jpeg', optimizedData, prompt, { aspectRatio: targetRatio }, onStatusUpdate);
     } catch (e) {
         return handleGeminiError(e);
     }
